@@ -125,5 +125,5 @@ variable "github_repo_owner" {
 variable "github_repo_name" {
   description = "GitHub repository name"
   type        = string
-  default     = "DevOps-Assignment"
+  default     = "PGAGI-DevOps-Assignment"
 }
