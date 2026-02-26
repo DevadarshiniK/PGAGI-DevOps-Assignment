@@ -127,7 +127,18 @@ jobs:
           ECR_REPOSITORY: ${{ needs.determine-environment.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          jq '.containerDefinitions[0].image = "'$ECR_REGISTRY'/'$ECR_REPOSITORY':'$IMAGE_TAG'"' task-def.json > task-def-updated.json
+          jq '{ 
+            family: .family,
+            taskRoleArn: .taskRoleArn,
+            executionRoleArn: .executionRoleArn,
+            networkMode: .networkMode,
+            containerDefinitions: .containerDefinitions,
+            requiresCompatibilities: .requiresCompatibilities,
+            cpu: .cpu,
+            memory: .memory,
+            placementConstraints: .placementConstraints,
+            volumes: .volumes
+          } | .containerDefinitions[0].image = "'$ECR_REGISTRY'/'$ECR_REPOSITORY':'$IMAGE_TAG'"' task-def.json > task-def-updated.json
 
       - name: Register new task definition
         id: register-task-def
