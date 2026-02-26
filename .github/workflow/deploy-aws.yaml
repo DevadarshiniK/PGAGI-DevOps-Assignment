@@ -1,0 +1,247 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - develop
+      - staging
+      - main
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'infrastructure/docker/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  determine-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      target_env: ${{ steps.set-env.outputs.target_env }}
+      ecr_repository: ${{ steps.set-env.outputs.ecr_repository }}
+    steps:
+      - name: Determine environment from branch
+        id: set-env
+        run: |
+          BRANCH=${{ github.ref_name }}
+          
+          case $BRANCH in
+            develop)
+              echo "environment=dev" >> $GITHUB_OUTPUT
+              echo "target_env=dev" >> $GITHUB_OUTPUT
+              echo "ecr_repository=devops-assignment-backend" >> $GITHUB_OUTPUT
+              ;;
+            staging)
+              echo "environment=staging" >> $GITHUB_OUTPUT
+              echo "target_env=staging" >> $GITHUB_OUTPUT
+              echo "ecr_repository=devops-assignment-backend" >> $GITHUB_OUTPUT
+              ;;
+            main)
+              echo "environment=prod" >> $GITHUB_OUTPUT
+              echo "target_env=prod" >> $GITHUB_OUTPUT
+              echo "ecr_repository=devops-assignment-backend" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "❌ Unknown branch: $BRANCH"
+              exit 1
+              ;;
+          esac
+          
+          echo "Deploying to: ${{ steps.set-env.outputs.target_env }}"
+
+  deploy:
+    needs: determine-environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          role-session-name: github-actions-${{ github.sha }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Retrieve all secrets from AWS Secrets Manager
+      - name: Retrieve deployment secrets
+        id: get-secrets
+        run: |
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id devops-assignment-${{ needs.determine-environment.outputs.target_env }} \
+            --region ${{ env.AWS_REGION }} \
+            --query SecretString \
+            --output text)
+          
+          echo "alb_dns_name=$(echo $SECRET | jq -r '.alb_dns_name')" >> $GITHUB_OUTPUT
+          echo "ecs_cluster_name=$(echo $SECRET | jq -r '.ecs_cluster_name')" >> $GITHUB_OUTPUT
+          echo "ecs_service_name=$(echo $SECRET | jq -r '.ecs_service_name')" >> $GITHUB_OUTPUT
+          echo "s3_bucket_name=$(echo $SECRET | jq -r '.s3_bucket_name')" >> $GITHUB_OUTPUT
+          echo "cloudfront_distribution_id=$(echo $SECRET | jq -r '.cloudfront_distribution_id')" >> $GITHUB_OUTPUT
+          echo "cloudfront_domain=$(echo $SECRET | jq -r '.cloudfront_domain')" >> $GITHUB_OUTPUT
+          echo "api_gateway_invoke_url=$(echo $SECRET | jq -r '.api_gateway_invoke_url')" >> $GITHUB_OUTPUT
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ============ BACKEND DEPLOYMENT ============
+      - name: Build and push backend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ needs.determine-environment.outputs.ecr_repository }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f infrastructure/docker/Dockerfile.backend \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ needs.determine-environment.outputs.target_env }} \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ needs.determine-environment.outputs.target_env }}
+
+      - name: Get current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition devops-assignment-backend \
+            --region ${{ env.AWS_REGION }} \
+            --query taskDefinition > task-def.json
+
+      - name: Update task definition with new image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ needs.determine-environment.outputs.ecr_repository }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          jq '.containerDefinitions[0].image = "'$ECR_REGISTRY'/'$ECR_REPOSITORY':'$IMAGE_TAG'"' task-def.json > task-def-updated.json
+
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://task-def-updated.json \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ steps.get-secrets.outputs.ecs_cluster_name }} \
+            --service ${{ steps.get-secrets.outputs.ecs_service_name }} \
+            --task-definition ${{ steps.register-task-def.outputs.task-def-arn }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for ECS deployment
+        run: |
+          sleep 30
+          aws ecs describe-services \
+            --cluster ${{ steps.get-secrets.outputs.ecs_cluster_name }} \
+            --services ${{ steps.get-secrets.outputs.ecs_service_name }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'services[0].{Status: status, RunningCount: runningCount, DesiredCount: desiredCount}'
+
+      # ============ FRONTEND DEPLOYMENT ============
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: ./frontend
+        env:
+          NEXT_PUBLIC_API_URL: ${{ steps.get-secrets.outputs.api_gateway_invoke_url }}
+        run: npm run build
+
+      - name: Optimize S3 upload
+        id: s3-upload
+        run: |
+          echo "Starting S3 sync to ${{ steps.get-secrets.outputs.s3_bucket_name }}"
+          aws s3 sync ./frontend/out s3://${{ steps.get-secrets.outputs.s3_bucket_name }}/ \
+            --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude ".next/*" \
+            --exclude "index.html"
+          
+          # Upload index.html with no-cache
+          aws s3 cp ./frontend/out/index.html s3://${{ steps.get-secrets.outputs.s3_bucket_name }}/ \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --content-type "text/html"
+
+      - name: Invalidate CloudFront cache
+        if: steps.get-secrets.outputs.cloudfront_distribution_id != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.get-secrets.outputs.cloudfront_distribution_id }} \
+            --paths "/*" \
+            --region ${{ env.AWS_REGION }}
+
+      # ============ HEALTH CHECK ============
+      - name: Health check backend
+        run: |
+          API_URL="${{ steps.get-secrets.outputs.api_gateway_invoke_url }}/api/health"
+          echo "Health checking: $API_URL"
+          
+          for i in {1..30}; do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "✅ Backend is healthy"
+              exit 0
+            fi
+            echo "Attempt $i/30: HTTP $HTTP_CODE, waiting..."
+            sleep 10
+          done
+          
+          echo "❌ Backend health check failed"
+          exit 1
+
+      # ============ NOTIFICATIONS ============
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## ✅ ${{ needs.determine-environment.outputs.target_env }} Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | ${{ needs.determine-environment.outputs.target_env }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Backend API** | ${{ steps.get-secrets.outputs.api_gateway_invoke_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Frontend CDN** | https://${{ steps.get-secrets.outputs.cloudfront_domain }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Task Definition** | ${{ steps.register-task-def.outputs.task-def-arn }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deployment success
+        if: success()
+        run: |
+          echo "✅ Deployment to ${{ needs.determine-environment.outputs.target_env }} successful!"
+          echo "Frontend: https://${{ steps.get-secrets.outputs.cloudfront_domain }}"
+          echo "Backend API: ${{ steps.get-secrets.outputs.api_gateway_invoke_url }}"
+
+      - name: Deployment failure
+        if: failure()
+        run: |
+          echo "❌ Deployment to ${{ needs.determine-environment.outputs.target_env }} failed"
+          exit 1
