@@ -6,11 +6,6 @@ on:
       - develop
       - staging
       - main
-    paths:
-      - 'backend/**'
-      - 'frontend/**'
-      - 'infrastructure/docker/**'
-      - '.github/workflows/deploy.yml'
   workflow_dispatch:
     inputs:
       environment:
