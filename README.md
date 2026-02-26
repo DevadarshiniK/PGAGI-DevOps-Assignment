@@ -1,125 +1,93 @@
-# DevOps Assignment
+# DevOps Assignment - AWS Infrastructure Setup
 
-This project consists of a FastAPI backend and a Next.js frontend that communicates with the backend.
+## Remote State Backend Setup
+First, create S3 bucket and DynamoDB table for Terraform state locking:
 
-## Project Structure
-
-```
-.
-├── backend/               # FastAPI backend
-│   ├── app/
-│   │   └── main.py       # Main FastAPI application
-│   └── requirements.txt    # Python dependencies
-└── frontend/              # Next.js frontend
-    ├── pages/
-    │   └── index.js     # Main page
-    ├── public/            # Static files
-    └── package.json       # Node.js dependencies
+```bash
+# Copy and apply backend configuration
+cp infrastructure/terraform/backend.tf /tmp/backend/
+cd /tmp/backend
+terraform init
+terraform apply -auto-approve
 ```
 
-## Prerequisites
+This creates:
+- **S3 Bucket**: Stores Terraform state files
+- **DynamoDB Table**: Prevents concurrent modifications
 
-- Python 3.8+
-- Node.js 16+
-- npm or yarn
-
-## Backend Setup
-
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-
-2. Create a virtual environment (recommended):
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: .\venv\Scripts\activate
-   ```
-
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Run the FastAPI server:
-   ```bash
-   uvicorn app.main:app --reload --port 8000
-   ```
-
-   The backend will be available at `http://localhost:8000`
-
-## Frontend Setup
-
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   # or
-   yarn
-   ```
-
-3. Configure the backend URL (if different from default):
-   - Open `.env.local`
-   - Update `NEXT_PUBLIC_API_URL` with your backend URL
-   - Example: `NEXT_PUBLIC_API_URL=https://your-backend-url.com`
-
-4. Run the development server:
-   ```bash
-   npm run dev
-   # or
-   yarn dev
-   ```
-
-   The frontend will be available at `http://localhost:3000`
-
-## Changing the Backend URL
-
-To change the backend URL that the frontend connects to:
-
-1. Open the `.env.local` file in the frontend directory
-2. Update the `NEXT_PUBLIC_API_URL` variable with your new backend URL
-3. Save the file
-4. Restart the Next.js development server for changes to take effect
-
-Example:
+## Environment Structure
 ```
-NEXT_PUBLIC_API_URL=https://your-new-backend-url.com
+infrastructure/terraform/
+├── dev/
+├── staging/
+└── prod/
 ```
 
-## For deployment:
-   ```bash
-   npm run build
-   # or
-   yarn build
-   ```
+## Resources Created Per Environment
+When you run Terraform in any environment, it creates:
 
-   AND
+| Resource | Description |
+|----------|-------------|
+| **VPC** | Network with public/private subnets |
+| **ECS** | Fargate cluster for backend API |
+| **ECR** | Docker image repository |
+| **ALB** | Load balancer for backend |
+| **S3** | Bucket for frontend static files |
+| **CloudFront** | CDN for frontend |
+| **Auto Scaling** | Scales ECS tasks based on CPU/memory |
+| **IAM Roles** | Permissions for ECS and GitHub Actions |
+| **CloudWatch** | Logs and container insights |
 
-   ```bash
-   npm run start
-   # or
-   yarn start
-   ```
+## Environment Configurations
 
-   The frontend will be available at `http://localhost:3000`
+| Setting | Dev | Staging | Prod |
+|---------|-----|---------|------|
+| CPU | 256 | 512 | 1024 |
+| Memory | 512MB | 1GB | 2GB |
+| Min Tasks | 1 | 1 | 2 |
+| Max Tasks | 2 | 4 | 6 |
 
-## Testing the Integration
+## Terraform Commands
 
-1. Ensure both backend and frontend servers are running
-2. Open the frontend in your browser (default: http://localhost:3000)
-3. If everything is working correctly, you should see:
-   - A status message indicating the backend is connected
-   - The message from the backend: "You've successfully integrated the backend!"
-   - The current backend URL being used
+### Initialize (First time only)
+```bash
+cd infrastructure/terraform/dev  # or staging/prod
+terraform init
+```
 
-## API Endpoints
+### See what will be created
+```bash
+terraform plan -var-file=terraform.tfvars
+```
 
-- `GET /api/health`: Health check endpoint
-  - Returns: `{"status": "healthy", "message": "Backend is running successfully"}`
+### Create infrastructure
+```bash
+terraform apply -var-file=terraform.tfvars -auto-approve
+```
 
-- `GET /api/message`: Get the integration message
-  - Returns: `{"message": "You've successfully integrated the backend!"}`
+### View outputs
+```bash
+terraform output
+```
+
+### Delete everything
+```bash
+terraform destroy -var-file=terraform.tfvars -auto-approve
+```
+
+## After Deployment
+You'll get these outputs:
+- `ecr_repository_url` - Where to push backend Docker images
+- `s3_bucket_name` - Where to upload frontend files
+- `cdn_endpoint` - Frontend URL
+- `ecs_service_url` - Backend API URL
+- `github_actions_role_arn` - IAM role for CI/CD
+
+## Quick Checklist
+- [ ] Run `terraform init`
+- [ ] Run `terraform plan` to review
+- [ ] Run `terraform apply` to create
+- [ ] Save the output values
+- [ ] Push backend image to ECR
+- [ ] Upload frontend to S3
+- [ ] Test the URLs
